@@ -1,1 +1,378 @@
+ /* IoT-Based Breathalyzer
+This system detects alcohol levels using an MQ3 sensor and controls vehicle motors based on alcohol detection. It also monitors for overspeed conditions and presence detection using an IR sensor. Alerts are sent via ESP32 when critical conditions are detected.
+ * Hardware components:
+ * - Arduino (main controller)
+ * - MQ3 alcohol sensor
+ * - IR sensor (for presence detection)
+ * - LCD Display (I2C interface)
+ * - Dual DC motors with driver
+ * - ESP32 or SIM800L module (for sending alerts)
+ * - LEDs (red and blue for status indication)
+ * - Buzzer (for audio alerts)
+ * - Speed control buttons
+ */
+// Include necessary libraries
+#include <LiquidCrystal_I2C.h>  // Library for I2C LCD display
+#include <SoftwareSerial.h>      // Library for serial communication with ESP32
 
+// Pin definitions for all components
+#define MQ3Sensor A0            // Analog pin for MQ3 alcohol sensor
+#define motor1ENA 5             // Enable pin for motor 1
+#define motor1Pin1 6            // Control pin 1 for motor 1
+#define motor1Pin2 7            // Control pin 2 for motor 1
+#define motor2Pin1 8            // Control pin 1 for motor 2
+#define motor2Pin2 9            // Control pin 2 for motor 2
+#define motor2ENB 10            // Enable pin for motor 2
+#define buzzer 4                // Digital pin for buzzer
+#define sensorThres 500         // Threshold value for alcohol detection
+#define IRSensor 11             // Digital pin for IR sensor (presence detection)
+#define redLED 2                // Digital pin for red LED (warning/stop indication)
+#define blueLED 3               // Digital pin for blue LED (normal operation indication)
+#define buttonIncreaseSpeed A1  // Analog pin for speed increase button
+#define buttonDecreaseSpeed A2  // Analog pin for speed decrease button
+
+// Constants for motor speed control
+const int restrictedSpeed = 80;  // Maximum allowed speed before overspeed alert
+const int normalSpeed = 60;      // Default operating speed
+int motorSpeed = normalSpeed;    // Current motor speed (variable)
+
+// Status flags for various conditions
+bool IRStatus = LOW;             // Status of IR sensor
+bool PersonDetected = false;     // Flag to track if person is detected
+bool alcoholPreviouslyDetected = false;  // Flag to track if alcohol was detected
+bool overSpeedDetected = false;  // Flag to track if overspeed was detected
+bool alcoholAlertSent = false;   // Flag to prevent multiple alcohol alerts
+bool overspeedAlertSent = false; // Flag to prevent multiple overspeed alerts
+
+// Initialize LCD with I2C address, 16 columns and 2 rows
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+// Initialize software serial communication with ESP32/SIM800L
+SoftwareSerial espSerial(12, 13); // RX, TX pins for ESP communication
+
+void setup() {
+  Serial.begin(9600);     // Initialize serial communication for debugging
+  espSerial.begin(9600);  // Initialize serial communication with ESP32/SIM800L
+  
+  // Initialize LCD and display welcome message
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(2, 0);
+  lcd.print(" IoT Based ");
+  lcd.setCursor(2, 1);
+  lcd.print("Breathalyser");
+  delay(3000);
+  lcd.clear();
+  
+  // Configure all pins
+  pinMode(MQ3Sensor, INPUT);  // Alcohol sensor as input
+  pinMode(IRSensor, INPUT);   // IR sensor as input
+  
+  // Motor control pins as output
+  pinMode(motor1Pin1, OUTPUT);
+  pinMode(motor1Pin2, OUTPUT);
+  pinMode(motor2Pin1, OUTPUT);
+  pinMode(motor2Pin2, OUTPUT);
+  pinMode(motor1ENA, OUTPUT);
+  pinMode(motor2ENB, OUTPUT);
+  
+  // Other output pins
+  pinMode(buzzer, OUTPUT);    // Buzzer for audio alerts
+  pinMode(redLED, OUTPUT);    // Red LED for warning/alerts
+  pinMode(blueLED, OUTPUT);   // Blue LED for normal operation
+  
+  // Speed control buttons with internal pull-up resistors
+  pinMode(buttonIncreaseSpeed, INPUT_PULLUP);
+  pinMode(buttonDecreaseSpeed, INPUT_PULLUP);
+  
+  // Initialize LEDs to off
+  digitalWrite(redLED, LOW);
+  digitalWrite(blueLED, LOW);
+}
+
+void loop() {
+  // Check IR sensor for presence detection
+  IRStatus = digitalRead(IRSensor);
+  
+  // If person is detected (IR sensor is LOW when object is detected)
+  if (IRStatus == LOW) {
+    // If this is the first time detecting a person
+    if (!PersonDetected) {
+      lcd.clear();
+      lcd.setCursor(1, 0);
+      lcd.print("Person Detect");
+      lcd.setCursor(1, 1);
+      lcd.print("* ENGINE ON *");
+      PersonDetected = true;
+      playPersonDetectedSound();  // Play welcome tone
+      delay(1000);
+    }
+    
+    // Read alcohol sensor value
+    int analogSensor = analogRead(MQ3Sensor);
+    Serial.println(analogSensor);  // Print value for debugging
+    
+    // Check for speed adjustment button presses
+    checkSpeedButtons();
+    
+    // Update LCD with current alcohol level and speed
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Alcohol :");
+    lcd.setCursor(12, 0);
+    lcd.print(analogSensor);
+    lcd.setCursor(0, 1);
+    lcd.print("Speed : ");
+    lcd.setCursor(12,1);
+    lcd.print(motorSpeed);
+    
+    // Check if alcohol is detected (above threshold)
+    if (analogSensor > sensorThres) {
+      alcoholPreviouslyDetected = true;
+      
+      // Activate warning indicators
+      digitalWrite(redLED, HIGH);
+      digitalWrite(blueLED, LOW);
+      playAlcoholDetectedSound();  // Play alcohol warning sound
+      
+      // Update LCD with alcohol detection message
+      lcd.clear();
+      lcd.setCursor(2, 0);
+      lcd.print("Drunk Detect");
+      lcd.setCursor(1, 1);
+      lcd.print("* ENGINE OFF *");
+      
+      delay(1000);
+      
+      // Send alert only once per detection event
+      if (!alcoholAlertSent) {
+        sendAlertToESP32(analogSensor, motorSpeed, "Alcohol Detected");
+        alcoholAlertSent = true;
+      }
+      
+      // Update LCD again with sensor values
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Alcohol :");
+      lcd.setCursor(12, 0);
+      lcd.print(analogSensor);
+      lcd.setCursor(0, 1);
+      lcd.print("Speed : ");
+      lcd.setCursor(12,1);
+      lcd.print(motorSpeed);
+      
+      // Gradually stop the motor for safety
+      gradualMotorStop();
+      delay(1000);
+    } 
+    // Check for overspeed condition
+    else if (motorSpeed > restrictedSpeed) {
+      // Activate warning indicators
+      digitalWrite(redLED, HIGH);
+      digitalWrite(blueLED, LOW);
+      playOverSpeedSound();  // Play overspeed warning sound
+      
+      // Update LCD with overspeed message
+      lcd.clear();
+      lcd.setCursor(3, 0);
+      lcd.print("Over Speed");
+      lcd.setCursor(1, 1);
+      lcd.print("* ENGINE OFF *");
+      delay(1000);
+      
+      // Send alert only once per overspeed event
+      if (!overspeedAlertSent) {
+        sendAlertToESP32(analogSensor, motorSpeed, "Overspeed Detected");
+        overspeedAlertSent = true;
+      }
+      
+      // Update LCD again with sensor values
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Alcohol :");
+      lcd.setCursor(12, 0);
+      lcd.print(analogSensor);
+      lcd.setCursor(0, 1);
+      lcd.print("Speed : ");
+      lcd.setCursor(12,1);
+      lcd.print(motorSpeed);
+      
+      // Gradually stop the motor for safety
+      gradualMotorStop();
+      delay(1000);
+    } 
+    // Normal operation (no alcohol, no overspeed)
+    else {
+      // Move motors at current speed
+      moveMotorsForward(motorSpeed);
+      
+      // Normal operation indicators
+      digitalWrite(blueLED, HIGH);
+      digitalWrite(redLED, LOW);
+      noTone(buzzer);  // Ensure buzzer is off
+      
+      // Reset alert flags if returning to normal after an alert condition
+      if (alcoholPreviouslyDetected || overSpeedDetected) {
+        alcoholPreviouslyDetected = false;
+        overSpeedDetected = false;
+        alcoholAlertSent = false;
+        overspeedAlertSent = false;
+      }
+    }
+  } 
+  // No person detected
+  else {
+    // Update LCD with no person message
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Person NotDetect");
+    lcd.setCursor(1, 1);
+    lcd.print("* ENGINE OFF *");
+    
+    // Stop motors and activate warning indicators
+    gradualMotorStop();
+    playPersonNotDetectedSound();
+    digitalWrite(redLED, HIGH);
+    digitalWrite(blueLED, LOW);
+    
+    // Reset detection flags
+    PersonDetected = false;
+    alcoholAlertSent = false;
+    overspeedAlertSent = false;
+    delay(1000);
+  }
+  delay(100);  // Small delay for stability
+}
+
+// Check if speed control buttons are pressed and adjust speed accordingly
+void checkSpeedButtons() {
+  // Increase speed button pressed (active LOW with pull-up)
+  if (digitalRead(buttonIncreaseSpeed) == LOW) {
+    motorSpeed = min(motorSpeed + 2, 100);  // Increase speed but cap at 100
+    delay(100);  // Debounce delay
+  }
+  // Decrease speed button pressed (active LOW with pull-up)
+  if (digitalRead(buttonDecreaseSpeed) == LOW) {
+    motorSpeed = max(motorSpeed - 2, 0);  // Decrease speed but not below 0
+    delay(100);  // Debounce delay
+  }
+}
+
+
+// Play ascending tones to indicate person detection
+void playPersonDetectedSound() {
+  tone(buzzer, 800, 100);   // Low frequency tone
+  delay(150);
+  tone(buzzer, 1000, 100);  // Medium frequency tone
+  delay(150);
+  tone(buzzer, 1200, 100);  // High frequency tone
+  delay(150);
+  noTone(buzzer);
+}
+
+// Play alternating tones to indicate alcohol detection (urgent alert)
+void playAlcoholDetectedSound() {
+  for (int i = 0; i < 2; i++) {
+    tone(buzzer, 1500, 200);  // High frequency tone
+    delay(300);
+    tone(buzzer, 1000, 200);  // Lower frequency tone
+    delay(300);
+  }
+  noTone(buzzer);
+}
+
+//Play repeated high tones to indicate overspeed condition
+void playOverSpeedSound() {
+  for (int i = 0; i < 3; i++) {
+    tone(buzzer, 2000, 200);  // Very high frequency tone (urgent)
+    delay(300);
+  }
+  noTone(buzzer);
+}
+
+// Play single low tone to indicate no person detected
+void playPersonNotDetectedSound() {
+  tone(buzzer, 500, 500);  // Low frequency, longer duration
+  delay(500);
+  noTone(buzzer);
+}
+
+//Set motors to move forward at specified speed
+void moveMotorsForward(int speed) {
+  // Set direction for motor 1 (forward)
+  digitalWrite(motor1Pin1, HIGH);
+  digitalWrite(motor1Pin2, LOW);
+  
+  // Set direction for motor 2 (forward)
+  digitalWrite(motor2Pin1, HIGH);
+  digitalWrite(motor2Pin2, LOW);
+  
+  // Set speed for both motors using PWM
+  analogWrite(motor1ENA, speed);
+  analogWrite(motor2ENB, speed);
+}
+
+// Gradually reduce motor speed to stop for smooth deceleration
+void gradualMotorStop() {
+  // Gradually reduce speed from current value to 0
+  for (int speed = motorSpeed; speed >= 0; speed -= 2) {
+    analogWrite(motor1ENA, speed);
+    analogWrite(motor2ENB, speed);
+    motorSpeed = speed;
+    
+    // Update speed display on LCD
+    lcd.setCursor(12, 1);
+    lcd.print(" ");          // Clear previous speed value
+    lcd.setCursor(12, 1);
+    lcd.print(motorSpeed);   // Display updated speed
+    delay(200);              // Small delay for smooth deceleration
+  }
+  stopMotors();  // Ensure motors are fully stopped
+}
+
+//Immediately stop motors
+void stopMotors() {
+  // Set both motors to no movement
+  digitalWrite(motor1Pin1, LOW);
+  digitalWrite(motor1Pin2, LOW);
+  digitalWrite(motor2Pin1, LOW);
+  digitalWrite(motor2Pin2, LOW);
+  
+  // Set speed to 0
+  analogWrite(motor1ENA, 0);
+  analogWrite(motor2ENB, 0);
+}
+
+// Send alert data to ESP32 in JSON format
+void sendAlertToESP32(int alcoholLevel, int speed, String status) {
+  // Hardcoded GPS coordinates (should be replaced with actual GPS module data)
+  String gpsLatitude = "10.795385";   // Example latitude
+  String gpsLongitude = "79.837206";  // Example longitude
+  
+  // Create JSON formatted data packet
+  String jsonData = "{";
+  jsonData += "\"status\": \"" + status + "\",";
+  jsonData += "\"alcohol_level\": " + String(alcoholLevel) + ",";
+  jsonData += "\"current_speed\": " + String(speed) + ",";
+  jsonData += "\"gps_location\": { \"latitude\": " + gpsLatitude + ", \"longitude\": " + gpsLongitude + " },";
+  jsonData += "\"google_maps_link\": \"https://www.google.com/maps?q=" + gpsLatitude + "," + gpsLongitude + "\"";
+  jsonData += "}";
+  
+  // Display status on LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Sending Data...");
+  lcd.setCursor(0, 1);
+  lcd.print(status);
+  
+  // Send JSON data to ESP32
+  espSerial.println(jsonData);
+ delay(1000);
+  
+  // Display confirmation on LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Data Sent");
+  lcd.setCursor(0, 1);
+  lcd.print(status);
+  delay(1000);
+}
