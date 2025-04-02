@@ -1,1 +1,161 @@
+/*
+ * ESP32 GPS and SMS Notification System 
+ 
+This program runs on an ESP32 and serves as the communication bridge between the Arduino-based breathalyzer system and external services. It receives alertdata from the Arduino, obtains GPS coordinates, and sends SMS notifications using the Twilio API when critical conditions are detected.
+ * Main functionalities:
+ * - Connects to WiFi for internet access
+ * - Communicates with Arduino via serial connection
+ * - Reads GPS data from a GPS module
+ * - Parses JSON data received from Arduino
+ * - Sends SMS alerts via Twilio API
+ */
+
+// Include necessary libraries
+#include <WiFi.h>        // Library for WiFi connectivity
+#include <HTTPClient.h>  // Library for making HTTP requests
+#include <TinyGPS++.h>   // Library for GPS data parsing
+#include <ArduinoJson.h> // Library for JSON processing
+
+// WiFi configuration
+const char* ssid = "sundaraperumal";  // WiFi network name
+const char* password = "sundaram";    // WiFi password
+
+// Twilio API credentials and phone number configuration
+String twilioSID = "ACcf2d0ae69d10fe4791c7b7cbea9e34ee";  // Twilio account SID
+String twilioAuthToken = "25bbd6583d5880eef9eb12c4d7543b8b";  // Twilio auth token
+String twilioPhone = "+18142643688";  // Twilio-provided phone number for sending SMS
+String targetPhone = "+916385345765";  // Recipient phone number for alerts
+
+// Initialize GPS parser
+TinyGPSPlus gps;
+
+// Configure hardware serial ports for different connections
+HardwareSerial gpsSerial(1);  // Serial port 1 for GPS module communication
+HardwareSerial espSerial(2);  // Serial port 2 for Arduino communication
+
+// Initialize HTTP client for API requests
+HTTPClient http;
+
+void setup() {
+  // Initialize primary serial for debug output
+  Serial.begin(115200);
+  
+  // Initialize GPS module communication
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);  // RX = GPIO16, TX = GPIO17
+  
+  // Initialize communication with Arduino
+  espSerial.begin(9600, SERIAL_8N1, 4, 2);    // RX = GPIO4, TX = GPIO2
+  
+  // Connect ESP32 to WiFi network
+  connectToWiFi();
+    Serial.println("Ready to receive alerts from Arduino...");
+}
+
+// Main program loop - runs continuously
+void loop() {
+  // Process any available GPS data
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());  // Parse each byte from GPS module
+  }
+  
+  // Check for messages from Arduino
+  while (espSerial.available()) {
+    // Read a complete line of data (JSON string)
+    String jsonData = espSerial.readStringUntil('\n');
+    Serial.println("Received: " + jsonData);
+    
+    // Process valid data (with minimum length check to avoid processing empty strings)
+    if (jsonData.length() > 5) {
+      parseAndSendSMS(jsonData);  // Parse JSON and send SMS notification
+    }
+  }
+}
+
+// Connect ESP32 to WiFi network
+void connectToWiFi() {
+  WiFi.begin(ssid, password);  // Start WiFi connection attempt
+  // Wait until connected, with status updates
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  
+  Serial.println("Connected to WiFi!");  // Connection successful
+}
+
+//Parse JSON data from Arduino and send SMS notification
+void parseAndSendSMS(String jsonData) {
+  // Create JSON document with sufficient capacity
+  StaticJsonDocument<512> doc;
+  
+  // Parse JSON string into document
+  DeserializationError error = deserializeJson(doc, jsonData);
+  
+  // Check for parsing errors
+  if (error) {
+    Serial.println("JSON Parsing failed!");
+    return;
+  }
+  
+  // Extract alert information from JSON
+  String status = doc["status"].as<String>();        // Alert type
+  int alcoholLevel = doc["alcohol_level"];           // Alcohol sensor reading
+  int currentSpeed = doc["current_speed"];           // Current vehicle speed
+  
+  // Initialize GPS coordinates (default values if GPS fix not available)
+  String gpsLatitude = "10.795385";    // Default latitude if GPS not available
+  String gpsLongitude = "79.837206";   // Default longitude if GPS not available
+  
+  // Use real GPS coordinates if available
+  if (gps.location.isValid()) {
+    gpsLatitude = String(gps.location.lat(), 6);   // Get latitude with 6 decimal 
+    gpsLongitude = String(gps.location.lng(), 6);  // Get longitude with 6 decimal 
+  }
+  
+  // Generate Google Maps link for location
+  String googleMapsLink = "https://maps.google.com/?q=" + gpsLatitude + "," + 
+  gpsLongitude;
+  
+  // Format SMS message with relevant information and emojis for readability
+  String message = "🚨 Alert: " + status + "\n";
+  message += "🍻 Alcohol Level: " + String(alcoholLevel) + "\n";
+  message += "🚗 Speed: " + String(currentSpeed) + " km/h\n";
+  message += "📍 Location: " + gpsLatitude + ", " + gpsLongitude + "\n";
+  message += "🔗 Google Maps: " + googleMapsLink + "\n";
+  
+  // Send the formatted SMS via Twilio
+  sendTwilioSMS(message);
+}
+
+//Send SMS notification using Twilio API
+void sendTwilioSMS(String message) {
+  // Construct Twilio API endpoint URL
+  String url = "https://api.twilio.com/2010-04-01/Accounts/" + twilioSID + "/Messages.json";
+  
+  // Initialize HTTP request
+  http.begin(url);
+  
+  // Set Basic authentication with Twilio credentials
+  http.setAuthorization(twilioSID.c_str(), twilioAuthToken.c_str());
+  
+  // Prepare request payload with required parameters
+  String payload = "To=" + targetPhone + "&From=" + twilioPhone + "&Body=" + message;
+  
+  // Set content type header for form data
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+  // Send POST request to Twilio API
+  int httpResponseCode = http.POST(payload);
+  
+  // Check for successful response
+  if (httpResponseCode > 0) {
+    Serial.println("✅ SMS sent successfully!");
+  } else {
+    Serial.println("❌ Error sending SMS. HTTP Response Code: " +
+ String(httpResponseCode));
+  }
+  
+  // Close HTTP connection
+  http.end();
+}
 
